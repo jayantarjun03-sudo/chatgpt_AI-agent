@@ -1,0 +1,84 @@
+rules:
+  - name: "P1 breached OR due soon (VIP gets incident)"
+    when:
+      priority: ["P1"]
+      # match if breached OR due within 120m is handled via two rules below for clarity
+    then:
+      level: "team"
+      channel: "both"
+      reason: "P1 always at least team attention"
+
+  - name: "P1 breached (VIP => incident, else manager)"
+    when:
+      priority: ["P1"]
+      state: "breached"
+      vip: true
+    then:
+      level: "incident"
+      channel: "both"
+      reason: "P1 breached for VIP"
+
+  - name: "P1 breached (non-VIP)"
+    when:
+      priority: ["P1"]
+      state: "breached"
+      vip: false
+    then:
+      level: "manager"
+      channel: "both"
+      reason: "P1 breached"
+
+  - name: "P1 due within 120m (VIP => manager, else team)"
+    when:
+      priority: ["P1"]
+      minutes_to_due_lte: 120
+      vip: true
+    then:
+      level: "manager"
+      channel: "slack"
+      reason: "P1 VIP approaching SLA"
+
+  - name: "P1 due within 120m (non-VIP)"
+    when:
+      priority: ["P1"]
+      minutes_to_due_lte: 120
+      vip: false
+    then:
+      level: "team"
+      channel: "slack"
+      reason: "P1 approaching SLA"
+
+  - name: "P2 breached >= 4h"
+    when:
+      priority: ["P2"]
+      state: "breached"
+      minutes_breached_gte: 240
+    then:
+      level: "manager"
+      channel: "both"
+      reason: "P2 breached for 4h+"
+
+  - name: "P2 stale updates >= 8h"
+    when:
+      priority: ["P2"]
+      minutes_since_update_gte: 480
+    then:
+      level: "team"
+      channel: "slack"
+      reason: "P2 has no update for 8h+"
+
+  - name: "Blocked tickets stale >= 6h"
+    when:
+      blocked_nonempty: true
+      minutes_since_update_gte: 360
+    then:
+      level: "team"
+      channel: "slack"
+      reason: "Blocked + stale; need dependency ETA"
+
+  - name: "Default: no escalation"
+    when: {}
+    then:
+      level: "none"
+      channel: "both"
+      reason: "No rule matched"
