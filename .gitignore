@@ -1,0 +1,14 @@
+# secrets
+.streamlit/secrets.toml
+
+# local state
+storage/casefile.sqlite
+storage/*.sqlite
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+.DS_Store
