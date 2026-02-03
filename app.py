@@ -381,7 +381,10 @@ with right:
     else:
         st.markdown(
             "<div class='event-log'>"
-            + "".join([f"<div class='event-line'>{st._utils.escape_markdown(line).replace(chr(10), '<br/>')}</div>" for line in logs[-200:]])
+           + "".join([
+    f"<div class='event-line'>{html.escape(str(line)).replace(chr(10), '<br/>')}</div>"
+    for line in logs[-200:]
+])
             + "</div>",
             unsafe_allow_html=True,
         )
