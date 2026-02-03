@@ -1,296 +1,283 @@
-# app.py
 import streamlit as st
-from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo
-    SGT = ZoneInfo("Asia/Singapore")
-except Exception:
-    SGT = None
-import json
-import os
 import pandas as pd
-from typing import Dict, Any, List
+import json
+import time
+from datetime import datetime
 
-# -------------------------
-# Config / file locations
-# -------------------------
-DAILY_BRIEF_JSON = "/mnt/data/daily_brief.json"
-DAILY_BRIEF_CSV = "/mnt/data/daily_brief.csv"
-EVENT_LOG_FILE = "event_log.json"  # optional local persistence
-
-# -------------------------
-# Utilities
-# -------------------------
-def now_ts() -> str:
-    if SGT:
-        return datetime.now(tz=SGT).strftime("%Y-%m-%d %H:%M:%S %Z")
+# ----------------------------
+# UI helpers
+# ----------------------------
+def now_stamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def init_event_log():
-    if "event_log" not in st.session_state:
-        # try to load persisted log, otherwise init empty
-        if os.path.exists(EVENT_LOG_FILE):
-            try:
-                with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
-                    st.session_state.event_log = json.load(f)
-            except Exception:
-                st.session_state.event_log = []
-        else:
-            st.session_state.event_log = []
+def add_log(message: str, level: str = "INFO"):
+    st.session_state.event_logs.insert(
+        0,  # newest on top
+        {"ts": now_stamp(), "level": level, "msg": message},
+    )
 
-def persist_event_log():
-    try:
-        with open(EVENT_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.event_log, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def render_event_log(logs):
+    # Simple console-like log panel (black bg, green text)
+    st.markdown(
+        """
+        <style>
+        .logbox {
+            background: #0b0f0c;
+            border-radius: 12px;
+            padding: 14px 14px;
+            border: 1px solid rgba(255,255,255,0.08);
+            height: 320px;
+            overflow-y: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 13px;
+            line-height: 1.45;
+            color: #7CFC90;
+        }
+        .logline { margin-bottom: 6px; white-space: pre-wrap; }
+        .lvl-WARN { color: #FFD166; }
+        .lvl-ERROR { color: #FF5C5C; }
+        .lvl-INFO { color: #7CFC90; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def log_event(action: str, ticket_id: str = None, details: str = None, tag: str = None, metadata: Dict[str, Any] = None):
-    entry: Dict[str, Any] = {
-        "ts": now_ts(),
-        "action": action,
-        "ticket_id": ticket_id,
-        "details": details or "",
-        "tag": tag or "",
-        "meta": metadata or {}
-    }
-    # newest-first
-    st.session_state.event_log.insert(0, entry)
-    persist_event_log()
+    lines = []
+    for e in logs:
+        cls = f"lvl-{e['level']}"
+        lines.append(f"<div class='logline {cls}'>{e['ts']} — {e['msg']}</div>")
+    st.markdown(f"<div class='logbox'>{''.join(lines) if lines else 'No events yet.'}</div>", unsafe_allow_html=True)
 
-# -------------------------
-# Load daily brief (CSV/JSON) or fallback sample
-# -------------------------
-def load_daily_brief() -> List[Dict[str, Any]]:
-    # Accepts either JSON list-of-objects or CSV with columns: id,status,breached,vendor,required_action (optional)
-    if os.path.exists(DAILY_BRIEF_JSON):
-        try:
-            with open(DAILY_BRIEF_JSON, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # ensure each item has expected fields
-            return [_normalize_ticket(x) for x in data]
-        except Exception as e:
-            st.warning(f"Failed to load {DAILY_BRIEF_JSON}: {e}")
+# ----------------------------
+# Data model assumptions
+# ----------------------------
+REQUIRED_COLUMNS = [
+    "ticket_id",
+    "type",
+    "vendor",
+    "sla_status",     # e.g. "OK", "BREACHED"
+    "breach_by_hours",# numeric, >0 indicates how late
+    "status",
+    "context",
+    "root_cause",
+    "impact",
+    "recommended_next_steps",
+]
 
-    if os.path.exists(DAILY_BRIEF_CSV):
-        try:
-            df = pd.read_csv(DAILY_BRIEF_CSV, dtype=str).fillna("")
-            tickets = []
-            for _, row in df.iterrows():
-                tickets.append({
-                    "id": str(row.get("id") or row.get("ticket_id") or ""),
-                    "status": str(row.get("status") or "open"),
-                    "breached": str(row.get("breached") or "").lower() in ("1","true","yes","y"),
-                    "vendor": str(row.get("vendor") or "vendor-x"),
-                    "required_action": str(row.get("required_action") or "")
-                })
-            return [_normalize_ticket(t) for t in tickets]
-        except Exception as e:
-            st.warning(f"Failed to load {DAILY_BRIEF_CSV}: {e}")
+def sample_data() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ticket_id": "ORD-10008",
+                "type": "DEVICE",
+                "vendor": "VendorA",
+                "sla_status": "BREACHED",
+                "breach_by_hours": 24,
+                "status": "Stuck",
+                "context": "Order breached 48h SLA by 24h; no state transition observed.",
+                "root_cause": "Payment authorised but not captured (confidence 91%).",
+                "impact": "Activation delayed; higher inbound contacts and churn risk.",
+                "recommended_next_steps": "Escalate to vendor with full diagnostic context and notify on-call.",
+            },
+            {
+                "ticket_id": "ORD-10012",
+                "type": "SIM",
+                "vendor": "VendorB",
+                "sla_status": "BREACHED",
+                "breach_by_hours": 9,
+                "status": "Stuck",
+                "context": "SIM order pending provisioning; downstream queue backlog suspected.",
+                "root_cause": "Downstream provisioning queue saturation.",
+                "impact": "Customer waiting for service activation.",
+                "recommended_next_steps": "Attempt auto-retry once; if still stuck, escalate to vendor.",
+            },
+            {
+                "ticket_id": "ORD-10019",
+                "type": "PLAN_CHANGE",
+                "vendor": "VendorC",
+                "sla_status": "OK",
+                "breach_by_hours": 0,
+                "status": "In progress",
+                "context": "Plan change in progress; within SLA.",
+                "root_cause": "N/A",
+                "impact": "None",
+                "recommended_next_steps": "Monitor.",
+            },
+        ]
+    )
 
-    # fallback sample data (if no daily brief provided)
-    sample = [
-        {"id": "TKT-1001", "status": "open", "breached": False, "vendor": "acme-corp", "required_action": "investigate"},
-        {"id": "TKT-1002", "status": "open", "breached": True, "vendor": "vendor-alpha", "required_action": "escalate"},
-        {"id": "TKT-1003", "status": "in_progress", "breached": False, "vendor": "vendor-beta", "required_action": "workaround"},
-        {"id": "TKT-1004", "status": "open", "breached": True, "vendor": "vendor-gamma", "required_action": "escalate"},
-        {"id": "TKT-1005", "status": "resolved", "breached": False, "vendor": "acme-corp", "required_action": "close"}
-    ]
-    return [_normalize_ticket(t) for t in sample]
+def load_uploaded_data(upload) -> pd.DataFrame:
+    if upload is None:
+        return sample_data()
 
-def _normalize_ticket(raw: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": str(raw.get("id") or raw.get("ticket_id") or raw.get("tid") or ""),
-        "status": str(raw.get("status") or "open"),
-        "breached": bool(raw.get("breached") is True or str(raw.get("breached") or "").lower() in ("1","true","yes","y")),
-        "vendor": str(raw.get("vendor") or "vendor-x"),
-        "required_action": str(raw.get("required_action") or "")
-    }
-
-# -------------------------
-# Business logic: simulation & escalation
-# -------------------------
-def escalate_to_vendor(ticket_id: str, vendor: str, reason: str):
-    # Hook: call vendor API / webhook / email here in production
-    escalation_msg = f"Escalation message sent to vendor '{vendor}' for ticket {ticket_id}: {reason}"
-    # Required: event log must contain that escalation message
-    log_event(action="escalation_sent", ticket_id=ticket_id, details=escalation_msg, tag="escalation", metadata={"vendor": vendor})
-    # Also add a compact escalated marker
-    log_event(action="ticket_escalated", ticket_id=ticket_id, details=f"Ticket escalated to {vendor}", tag="escalation", metadata={"vendor": vendor})
-
-def simulate_agent_action(ticket: Dict[str, Any]):
-    tid = ticket["id"]
-    # Agent assigns and takes action (simulate)
-    assign_detail = f"Agent assigned to ticket {tid}"
-    log_event(action="agent_assigned", ticket_id=tid, details=assign_detail, tag="info", metadata={"vendor": ticket["vendor"]})
-
-    action_taken = ticket.get("required_action") or ("follow-up" if not ticket.get("breached") else "escalation follow-up")
-    action_detail = f"Agent action for {tid}: {action_taken}"
-    log_event(action="agent_action_taken", ticket_id=tid, details=action_detail, tag="info", metadata={"action": action_taken})
-
-def process_and_simulate(tickets: List[Dict[str, Any]]):
-    # Process tickets: detect breach, log, escalate, then simulate agent action for each ticket.
-    # Order: oldest-first processing for readability (but logged newest-first)
-    for t in tickets:
-        tid = t["id"]
-        status = t["status"]
-        if t["breached"]:
-            # log the breach event (requirement #2: must show breach + escalation message)
-            log_event(action="ticket_breached", ticket_id=tid, details=f"Status={status}", tag="breach")
-            escalate_to_vendor(ticket_id=tid, vendor=t.get("vendor", "vendor-x"), reason="SLA breach detected")
-        else:
-            log_event(action="ticket_checked", ticket_id=tid, details=f"Status={status}", tag="info")
-        # simulate an agent taking the next step in every case
-        simulate_agent_action(t)
-
-# -------------------------
-# UI: right panel event log (compact)
-# -------------------------
-def _badge_html(tag: str) -> str:
-    colors = {
-        "breach": "#D9534F",      # red
-        "escalation": "#F0AD4E",  # orange
-        "info": "#5BC0DE"         # blue
-    }
-    text = tag.upper() if tag else ""
-    color = colors.get(tag, "#999")
-    return f"<span style='background:{color};color:white;padding:2px 6px;border-radius:6px;font-size:11px'>{text}</span>"
-
-def render_event_log_panel(panel_width_ratio: int = 1):
-    left, right = st.columns([3, panel_width_ratio])
-    with right:
-        st.markdown("## System Event Log")
-        st.markdown("<small>Concise timeline — newest first. Shows tickets and actions taken.</small>", unsafe_allow_html=True)
-
-        # controls
-        cols = st.columns([2, 2, 1, 1])
-        with cols[0]:
-            filter_choice = st.selectbox("Filter", ["All", "Breach", "Escalation", "Info"], index=0)
-        with cols[1]:
-            q = st.text_input("Search ticket id", value="")
-        with cols[2]:
-            if st.button("Export"):
-                st.download_button("Download JSON", json.dumps(st.session_state.event_log, indent=2), file_name="event_log.json", mime="application/json")
-        with cols[3]:
-            if st.button("Clear"):
-                st.session_state.event_log = []
-                persist_event_log()
-                st.experimental_rerun()
-
-        total = len(st.session_state.event_log)
-        breach_count = sum(1 for e in st.session_state.event_log if e.get("tag") == "breach")
-        esc_count = sum(1 for e in st.session_state.event_log if e.get("tag") == "escalation")
-        st.markdown(f"**Total:** {total} &nbsp;|&nbsp; 🔥 **Breaches:** {breach_count} &nbsp;|&nbsp; 🚨 **Escalations:** {esc_count}")
-
-        st.write("")
-        if not st.session_state.event_log:
-            st.info("No events yet.")
-            return
-
-        def passes_filters(e):
-            if filter_choice == "Breach" and e.get("tag") != "breach":
-                return False
-            if filter_choice == "Escalation" and e.get("tag") != "escalation":
-                return False
-            if filter_choice == "Info" and e.get("tag") != "info":
-                return False
-            if q:
-                return (q.lower() in (e.get("ticket_id") or "").lower()) or (q.lower() in (e.get("details") or "").lower())
-            return True
-
-        displayed = 0
-        for e in st.session_state.event_log:
-            if not passes_filters(e):
-                continue
-            displayed += 1
-            ts = e.get("ts", "")
-            action = e.get("action", "")
-            tid = e.get("ticket_id") or "-"
-            details = e.get("details", "")
-            tag = e.get("tag", "")
-
-            header_html = (
-                f"<div style='display:flex;align-items:center;justify-content:space-between;'>"
-                f"<div style='line-height:1.1'>"
-                f"<strong style='font-size:13px'>{ts}</strong><br>"
-                f"<code style='font-size:12px'>{action}</code> &nbsp; <strong style='font-size:13px'>({tid})</strong>"
-                f"</div>"
-                f"<div>{_badge_html(tag)}</div>"
-                f"</div>"
-            )
-            with st.expander(label="", expanded=False):
-                st.markdown(header_html, unsafe_allow_html=True)
-                if details:
-                    st.markdown(f"<div style='color:#333;margin-top:6px'>{details}</div>", unsafe_allow_html=True)
-                meta = e.get("meta") or {}
-                if meta:
-                    st.markdown(f"<small style='color:#666'>Meta: {json.dumps(meta)}</small>", unsafe_allow_html=True)
-                st.write("---")
-
-        if displayed == 0:
-            st.info("No events match your filters/search.")
-
-# -------------------------
-# Main app UI
-# -------------------------
-def main():
-    st.set_page_config(layout="wide")
-    st.title("Ticket Monitor — Automated Daily Brief Simulation")
-
-    init_event_log()
-
-    # Load brief (show brief summary on the left)
-    tickets = load_daily_brief()
-    left, _ = st.columns([3, 1])
-    with left:
-        st.header("Daily Brief (auto-detected)")
-        st.markdown(f"Loaded **{len(tickets)}** tickets from daily brief (fallback sample used if no file).")
-        # show a small table for clarity
-        if tickets:
-            df = pd.DataFrame(tickets)
-            st.dataframe(df)
-
-        st.write("")
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            auto_run_if_exists = st.checkbox("Auto-run simulation when a daily brief file exists", value=False)
-        with col2:
-            animate = st.checkbox("Animate (slow) simulation", value=False)
-
-        # Run control: automatic if file exists + user opted in, or manual button
-        has_brief_file = os.path.exists(DAILY_BRIEF_JSON) or os.path.exists(DAILY_BRIEF_CSV)
-        run_now = False
-        if auto_run_if_exists and has_brief_file:
-            run_now = True
-        if st.button("Run simulation now"):
-            run_now = True
-
-        if run_now:
-            # If animate requested, we can optionally slow it down — but avoid long sleeps in prod.
-            if animate:
-                # naive slow animation: we will log with progressively earlier timestamps so newest-first shows nicely.
-                for t in tickets:
-                    process_single_for_animation(t)
-                st.experimental_rerun()
-            else:
-                process_and_simulate(tickets)
-                st.success("Simulation completed. See system event log on the right.")
-
-    # Show the right-hand event log
-    render_event_log_panel(panel_width_ratio=1)
-
-# A tiny helper for animate mode to inject staggered timestamps (keeps logic simple)
-def process_single_for_animation(ticket: Dict[str, Any]):
-    # This function mimics a small step-by-step simulation; it's fine if timestamps are very close
-    tid = ticket["id"]
-    status = ticket["status"]
-    if ticket["breached"]:
-        log_event(action="ticket_breached", ticket_id=tid, details=f"Status={status}", tag="breach")
-        # small synthetic wait represented by adding another event immediately
-        escalate_to_vendor(ticket_id=tid, vendor=ticket.get("vendor", "vendor-x"), reason="SLA breach detected")
+    name = upload.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(upload)
+    elif name.endswith(".json"):
+        raw = json.load(upload)
+        # Accept either list-of-dicts or dict with "tickets" key
+        if isinstance(raw, dict) and "tickets" in raw:
+            raw = raw["tickets"]
+        df = pd.DataFrame(raw)
     else:
-        log_event(action="ticket_checked", ticket_id=tid, details=f"Status={status}", tag="info")
-    simulate_agent_action(ticket)
+        st.error("Please upload a CSV or JSON file.")
+        return sample_data()
 
-if __name__ == "__main__":
-    main()
+    # Gentle fallback: add missing columns as blanks (so UI still works)
+    for c in REQUIRED_COLUMNS:
+        if c not in df.columns:
+            df[c] = "" if c not in ["breach_by_hours"] else 0
+
+    # Normalize types
+    df["breach_by_hours"] = pd.to_numeric(df["breach_by_hours"], errors="coerce").fillna(0)
+    df["sla_status"] = df["sla_status"].fillna("OK").astype(str)
+    return df
+
+# ----------------------------
+# Breach detection + action decision
+# ----------------------------
+def detect_breached(df: pd.DataFrame) -> pd.DataFrame:
+    # Breached if explicitly marked, OR breach_by_hours > 0
+    breached = df[(df["sla_status"].str.upper() == "BREACHED") | (df["breach_by_hours"] > 0)].copy()
+    return breached
+
+def decide_action(ticket_row: pd.Series) -> str:
+    """
+    Simple heuristic:
+      - If recommended_next_steps mentions 'auto-retry' => AUTO_RETRY
+      - Else => ESCALATE
+    """
+    steps = str(ticket_row.get("recommended_next_steps", "")).lower()
+    if "auto-retry" in steps or "retry" in steps:
+        return "AUTO_RETRY"
+    return "ESCALATE"
+
+def simulate_agent_run(df: pd.DataFrame):
+    add_log("Agent run started: Checked SLA deadlines for all tickets")
+
+    breached_df = detect_breached(df)
+    if breached_df.empty:
+        add_log("No breached tickets detected. Agent run completed.")
+        return
+
+    add_log(f"Detected {len(breached_df)} breached ticket(s)")
+    time.sleep(0.15)
+
+    for _, t in breached_df.iterrows():
+        tid = t["ticket_id"]
+        vendor = t["vendor"]
+        breach_h = t["breach_by_hours"]
+
+        add_log(f"Diagnosing {tid}: SLA breached by +{breach_h:.0f}h; analysing context/root cause")
+        time.sleep(0.15)
+
+        action = decide_action(t)
+        add_log(f"Agent decision for {tid} → {action}")
+
+        # Required: for each breached ticket, show escalation message sent + escalated
+        if action == "ESCALATE":
+            add_log(f"{tid}: Escalation message sent to vendor {vendor}", level="WARN")
+            time.sleep(0.10)
+            add_log(f"{tid}: Escalated to vendor system / ops queue for further action", level="WARN")
+        else:
+            add_log(f"{tid}: Triggered AUTO_RETRY with vendor {vendor}")
+            time.sleep(0.10)
+            # If still breached after retry (simulation), escalate anyway
+            add_log(f"{tid}: Auto-retry did not resolve within expected window → fallback to ESCALATE", level="WARN")
+            add_log(f"{tid}: Escalation message sent to vendor {vendor}", level="WARN")
+            add_log(f"{tid}: Escalated to vendor system / ops queue for further action", level="WARN")
+
+        time.sleep(0.15)
+
+    add_log("Agent run completed: actions logged for breached tickets")
+
+# ----------------------------
+# Streamlit App
+# ----------------------------
+st.set_page_config(page_title="Ticket Ops Dashboard", layout="wide")
+
+if "event_logs" not in st.session_state:
+    st.session_state.event_logs = []
+    add_log("App loaded")
+
+# Top-level layout: main area + right panel
+main_col, right_col = st.columns([2.4, 1.0], gap="large")
+
+with right_col:
+    st.subheader("AI Agent Progress")
+    st.caption("Uploads drive the run. No manual ticket processing.")
+
+    upload = st.file_uploader("Upload test data (CSV/JSON)", type=["csv", "json"])
+
+    st.divider()
+    run = st.button("Run agent on current data", use_container_width=True)
+
+    st.subheader("Agent Event Logs")
+    render_event_log(st.session_state.event_logs)
+
+with main_col:
+    df = load_uploaded_data(upload)
+
+    st.title("Daily Ticket Dashboard")
+
+    # Dashboard metrics (top cards)
+    total = len(df)
+    breached = len(detect_breached(df))
+    stuck = int((df["status"].astype(str).str.lower() == "stuck").sum())
+    by_type = df["type"].value_counts().to_dict()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Tickets", total)
+    c2.metric("Breached Tickets", breached)
+    c3.metric("Stuck Tickets", stuck)
+    c4.metric("Ticket Types", ", ".join([f"{k}:{v}" for k, v in list(by_type.items())[:3]]) or "-")
+
+    st.markdown("### Ticket Queue")
+
+    # Queue table-ish view
+    queue_cols = st.columns([1.2, 1.0, 1.2, 1.0, 1.0])
+    queue_cols[0].markdown("**Ticket**")
+    queue_cols[1].markdown("**Type**")
+    queue_cols[2].markdown("**SLA Status**")
+    queue_cols[3].markdown("**Action**")
+    queue_cols[4].markdown("**Details**")
+
+    for _, t in df.iterrows():
+        tid = t["ticket_id"]
+        ttype = t["type"]
+        sla = str(t["sla_status"]).upper()
+        breach_h = float(t["breach_by_hours"]) if pd.notna(t["breach_by_hours"]) else 0
+        action = decide_action(t) if (sla == "BREACHED" or breach_h > 0) else "MONITOR"
+
+        row = st.columns([1.2, 1.0, 1.2, 1.0, 1.0])
+
+        row[0].write(tid)
+        row[1].write(ttype)
+
+        if sla == "BREACHED" or breach_h > 0:
+            row[2].markdown(f"**:red[SLA BREACHED]**  \n+{breach_h:.0f}h")
+        else:
+            row[2].markdown("**:green[OK]**")
+
+        row[3].markdown(f"**{action}**")
+
+        with row[4]:
+            with st.expander("View"):
+                st.markdown("**Status**")
+                st.write(t.get("status", ""))
+
+                st.markdown("**Context**")
+                st.write(t.get("context", ""))
+
+                st.markdown("**Root cause**")
+                st.write(t.get("root_cause", ""))
+
+                st.markdown("**Impact**")
+                st.write(t.get("impact", ""))
+
+                st.markdown("**Recommended next steps**")
+                st.write(t.get("recommended_next_steps", ""))
+
+    if run:
+        simulate_agent_run(df)
+        st.rerun()
