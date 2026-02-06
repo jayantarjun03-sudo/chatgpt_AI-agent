@@ -1,7 +1,6 @@
-# app.py
 import json
 import html
-import hashlib
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -9,9 +8,10 @@ import pandas as pd
 import streamlit as st
 
 
-# ----------------------------
-# Time + logging helpers
-# ----------------------------
+# ============================
+# Helpers
+# ============================
+
 def _now() -> datetime:
     return datetime.now()
 
@@ -30,21 +30,18 @@ def reset_simulation(clear_data: bool = False) -> None:
     st.session_state["agent_last_run"] = None
     st.session_state["agent_next_run"] = None
     st.session_state["agent_progress"] = []
-    st.session_state["pending_vendor_fixes"] = {}
-    st.session_state["agent_running"] = False
-    # keep memory unless you want a hard reset
-    # st.session_state["agent_memory"] = {}
+    st.session_state["pending_vendor_responses"] = []  # list[dict]
+    st.session_state["agent_memory"] = _default_agent_memory()
     if clear_data:
         st.session_state["data_df"] = None
-        st.session_state["data_fingerprint"] = None
-        st.session_state["data_source_name"] = None
+        st.session_state["last_upload_fingerprint"] = None
 
 
-# ----------------------------
-# Upload + data normalization
-# ----------------------------
-def _fingerprint_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+def _fingerprint_upload(uploaded_file) -> Optional[str]:
+    if uploaded_file is None:
+        return None
+    # best-effort fingerprint to avoid reloading & overwriting updated df on reruns
+    return f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 'na')}"
 
 
 def _safe_read_upload(uploaded_file) -> Optional[pd.DataFrame]:
@@ -70,8 +67,7 @@ def _safe_read_upload(uploaded_file) -> Optional[pd.DataFrame]:
 
 def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize expected columns (best-effort).
-    Canonical:
+    Expected:
       ticket_id, type, status, sla_status, breach_hours, vendor,
       context, root_cause, impact, recommended_next_steps, action
     """
@@ -88,7 +84,6 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
         "sla_breached": "sla_status",
         "breach": "sla_status",
         "breach_hrs": "breach_hours",
-        "breach_hours": "breach_hours",
         "rca": "root_cause",
         "rootcause": "root_cause",
         "next_steps": "recommended_next_steps",
@@ -118,7 +113,6 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["ticket_id"] = df["ticket_id"].astype(str)
     df["type"] = df["type"].astype(str).str.upper()
     df["status"] = df["status"].astype(str)
-
     df["sla_status"] = df["sla_status"].astype(str).str.upper()
 
     def parse_breach(x):
@@ -135,7 +129,7 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["breach_hours_num"] = df["breach_hours"].apply(parse_breach)
 
     def infer_action(row):
-        # If already fixed, keep it fixed.
+        # if already FIXED, keep it
         if str(row.get("status", "")).strip().upper() == "FIXED":
             return "FIXED"
         if isinstance(row.get("action"), str) and row["action"].strip():
@@ -147,11 +141,6 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
         return "MONITOR"
 
     df["action"] = df.apply(infer_action, axis=1)
-
-    # Clean up "nan" strings
-    for c in ["vendor", "context", "root_cause", "impact", "recommended_next_steps"]:
-        df[c] = df[c].replace("nan", None).replace("NAN", None)
-
     return df
 
 
@@ -170,105 +159,143 @@ def _ticket_types_summary(df: pd.DataFrame) -> str:
     return " · ".join([f"{k}:{v}" for k, v in counts.items()])
 
 
-def update_ticket(df: pd.DataFrame, ticket_id: str, updates: Dict[str, Any]) -> pd.DataFrame:
-    """Update a single ticket row in the dataframe by ticket_id."""
-    if df is None or df.empty:
-        return df
-    df = df.copy()
-    mask = df["ticket_id"].astype(str) == str(ticket_id)
-    if mask.any():
-        for k, v in updates.items():
-            if k in df.columns:
-                df.loc[mask, k] = v
-    return df
+# ============================
+# Agent: Memory + External Context (simulated)
+# ============================
+
+def _default_agent_memory() -> Dict[str, Dict[str, Any]]:
+    """
+    Very small “policy memory”.
+    Each policy has:
+      - match_keywords: list[str] (simple keyword match against context/root_cause)
+      - description: str
+      - action: str
+      - steps: list[str]
+    """
+    return {
+        "GENERIC_SLA_BREACH": {
+            "match_keywords": ["breach", "sla"],
+            "description": "Generic SLA breach escalation",
+            "action": "ESCALATE",
+            "steps": [
+                "Attach basic diagnostics",
+                "Escalate to vendor/ops queue",
+            ],
+        }
+    }
 
 
-# ----------------------------
-# "External system" knowledge simulation
-# ----------------------------
-def external_context_lookup(row: pd.Series) -> Optional[Dict[str, Any]]:
+def _external_system_lookup(row: pd.Series) -> Optional[Dict[str, Any]]:
     """
-    Simulates querying an external system/KB. Returns a learned policy dict or None.
-    This is where you make the "self-learning" story deterministic for test tickets.
+    Simulated “external knowledge system”.
+    Returns a new policy if it recognizes the scenario.
     """
-    # You can make this rule-based on context/root_cause/type/vendor
+    context = (str(row.get("context", "")) + " " + str(row.get("root_cause", ""))).lower()
     ttype = str(row.get("type", "")).upper()
-    ctx = (row.get("context") or "")
-    rca = (row.get("root_cause") or "")
-    vendor = row.get("vendor") or "Vendor"
 
-    blob = f"{ttype} {ctx} {rca}".lower()
-
-    # Example unknown scenario -> learned policy:
-    # PORTING stuck at NPDB with gateway timeout -> escalate to NPDB/vendor with diagnostics, wait response, apply fix.
-    if ttype == "PORTING" and ("npdb" in blob) and ("timeout" in blob or "gateway" in blob):
+    # The demo scenario you want: Porting stuck due to NPDB gateway timeout
+    if ttype == "PORTING" and ("npdb" in context) and ("timeout" in context or "gateway" in context):
         return {
-            "scenario_id": "PORTING_NPDB_GATEWAY_TIMEOUT",
-            "title": "Port-in stuck due to NPDB gateway timeout; escalate to NPDB/Vendor queue and attach diagnostics",
-            "match": {
-                "type": "PORTING",
-                "contains_any": ["npdb", "timeout", "gateway"],
-            },
+            "policy_id": "PORTING_NPDB_GATEWAY_TIMEOUT",
+            "description": "Port-in stuck due to NPDB gateway timeout; escalate to NPDB/Vendor queue and attach diagnostics",
+            "action": "ESCALATE",
+            "match_keywords": ["npdb", "timeout", "gateway"],
             "steps": [
                 "Pull NPDB gateway error metrics for last 60 minutes",
                 "Attach timeout traces and correlation IDs",
                 "Escalate to NPDB vendor queue with diagnostics",
                 "Await vendor response and apply provided fix if available",
             ],
-            "action": "ESCALATE",
-            "vendor_queue": vendor,
-            "fix_after_seconds": 5,
-            "vendor_response_text": "NPDB vendor responded with gateway configuration fix applied",
+            "vendor_response": "NPDB vendor responded with gateway configuration fix applied",
+            "fix_action": "Applying vendor-provided fix (e.g., gateway retry/backoff config)",
         }
 
     return None
 
 
-def memory_match(row: pd.Series, memory: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Match row against stored learned scenarios.
-    This keeps it intentionally simple for the demo.
-    """
-    ttype = str(row.get("type", "")).upper()
-    ctx = (row.get("context") or "")
-    rca = (row.get("root_cause") or "")
-    blob = f"{ttype} {ctx} {rca}".lower()
-
-    for scenario_id, policy in memory.items():
-        m = policy.get("match", {})
-        if str(m.get("type", "")).upper() and str(m.get("type", "")).upper() != ttype:
-            continue
-        contains_any = [s.lower() for s in (m.get("contains_any") or [])]
-        if contains_any and not any(term in blob for term in contains_any):
-            continue
-        return policy
-
+def _memory_match_policy(memory: Dict[str, Dict[str, Any]], row: pd.Series) -> Optional[str]:
+    haystack = (str(row.get("context", "")) + " " + str(row.get("root_cause", "")) + " " + str(row.get("sla_status", ""))).lower()
+    for pid, pol in memory.items():
+        kws = [k.lower() for k in pol.get("match_keywords", [])]
+        if any(k in haystack for k in kws):
+            return pid
     return None
 
 
-# ----------------------------
+def _attach_diagnostics(tid: str) -> None:
+    # Just logs for simulation
+    log_event(f"{tid}: Attaching traces/correlation IDs for {tid} and NPDB gateway errors")
+
+
+def _schedule_vendor_response(ticket_id: str, vendor_response: str, fix_action: str, delay_seconds: int = 5) -> None:
+    st.session_state.setdefault("pending_vendor_responses", [])
+    st.session_state["pending_vendor_responses"].append(
+        {
+            "ticket_id": ticket_id,
+            "execute_at": (_now() + timedelta(seconds=delay_seconds)).timestamp(),
+            "vendor_response": vendor_response,
+            "fix_action": fix_action,
+        }
+    )
+
+
+def _mark_ticket_fixed(ticket_id: str) -> None:
+    df = st.session_state.get("data_df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+
+    mask = df["ticket_id"].astype(str) == str(ticket_id)
+    if not mask.any():
+        return
+
+    df.loc[mask, "status"] = "FIXED"
+    df.loc[mask, "sla_status"] = "RESOLVED"
+    df.loc[mask, "action"] = "FIXED"
+    df.loc[mask, "breach_hours"] = "0h"
+    df.loc[mask, "breach_hours_num"] = 0.0
+
+    st.session_state["data_df"] = df
+
+
+def process_pending_vendor_responses() -> None:
+    pending = st.session_state.get("pending_vendor_responses", [])
+    if not pending:
+        return
+
+    now_ts = _now().timestamp()
+    remaining = []
+    for item in pending:
+        if now_ts >= float(item["execute_at"]):
+            tid = item["ticket_id"]
+            log_event(f"{tid}: Received response from NPDB vendor: {item['vendor_response']}")
+            log_event(f"{tid}: {item['fix_action']} for {tid}")
+            _mark_ticket_fixed(tid)
+            log_event(f"{tid}: Ticket updated to FIXED in system (status changed, monitoring resumed)")
+        else:
+            remaining.append(item)
+
+    st.session_state["pending_vendor_responses"] = remaining
+
+
+def _pending_countdown_seconds() -> Optional[int]:
+    pending = st.session_state.get("pending_vendor_responses", [])
+    if not pending:
+        return None
+    soonest = min(float(p["execute_at"]) for p in pending)
+    return max(0, int(round(soonest - _now().timestamp())))
+
+
+# ============================
 # Agent simulation
-# ----------------------------
+# ============================
+
 def simulate_agent(df: pd.DataFrame) -> None:
-    """
-    Simulate an agent run:
-      - detects breached tickets
-      - for each breached ticket:
-          - if already FIXED -> skip
-          - try memory match
-          - if none -> log unknown scenario, query external system, learn new policy if available
-          - rerun evaluation with updated memory
-          - execute: ESCALATE / AUTO_RETRY / MONITOR
-      - if learned policy indicates a vendor response, schedule a pending fix (no sleep)
-    """
     if df is None or df.empty:
         st.warning("No data loaded.")
         return
 
-    memory = st.session_state.setdefault("agent_memory", {})
+    memory = st.session_state.get("agent_memory") or _default_agent_memory()
     st.session_state["agent_progress"] = []
-    st.session_state["agent_running"] = True
-
     log_event("Agent run started: scanning ticket queue")
 
     st.session_state["agent_progress"].append("Checked SLA deadlines for all tickets")
@@ -283,29 +310,26 @@ def simulate_agent(df: pd.DataFrame) -> None:
         log_event(f"Flagged {stuck_count} stuck tickets")
 
     breached_df = df[df.apply(_is_breached, axis=1)].copy()
-
     if breached_df.empty:
         st.session_state["agent_progress"].append("No breached tickets detected")
         log_event("No breached tickets detected; monitoring continues")
         st.session_state["agent_last_run"] = _now()
         st.session_state["agent_next_run"] = _now() + timedelta(minutes=30)
         log_event("Agent run completed")
-        st.session_state["agent_running"] = False
         return
 
     for _, row in breached_df.iterrows():
         tid = row.get("ticket_id", "UNKNOWN")
         ttype = row.get("type", "UNKNOWN")
         vendor = row.get("vendor") or "Vendor"
-        status_now = str(row.get("status", "")).strip().upper()
-
-        if status_now == "FIXED":
-            log_event(f"{tid}: Skipping — already FIXED")
-            continue
-
         breach_hours = row.get("breach_hours") or (
             f"+{int(row['breach_hours_num'])}h" if pd.notna(row.get("breach_hours_num")) else "N/A"
         )
+
+        # If already fixed, skip
+        if str(row.get("status", "")).strip().upper() == "FIXED":
+            log_event(f"{tid}: Already FIXED; skipping")
+            continue
 
         diag = row.get("root_cause") or "No explicit root cause; correlating signals"
         st.session_state["agent_progress"].append(
@@ -313,352 +337,32 @@ def simulate_agent(df: pd.DataFrame) -> None:
         )
         log_event(f"{tid}: Diagnosing — {ttype} breached by {breach_hours}; analysing context/root cause")
 
-        # 1) Try learned memory match
-        policy = memory_match(row, memory)
+        # Step 1: Try known memory
+        matched_policy_id = _memory_match_policy(memory, row)
 
-        if policy is None:
-            # 1) Unknown scenario detected
+        # For the demo: treat PORTING+NPDB timeout as “unknown” unless learned
+        if matched_policy_id is None:
             log_event(f"{tid}: Unknown scenario detected (no specific playbook match)")
-            # 2) Query external system
             log_event(f"{tid}: Querying external system for contextual knowledge")
-            learned = external_context_lookup(row)
 
+            learned = _external_system_lookup(row)
             if learned:
-                # Learn new scenario into memory (no human intervention)
-                memory[learned["scenario_id"]] = learned
-                st.session_state["agent_memory"] = memory  # persist
-                log_event(
-                    f"{tid}: Learned new scenario → {learned['scenario_id']} ({learned.get('title','')})"
-                )
-                for step in learned.get("steps", []):
-                    log_event(f"{tid}: Learned step added → {step}")
-                # 3) Rerun evaluation with updated memory
-                log_event(f"{tid}: Re-running ticket evaluation using updated memory")
-                policy = memory_match(row, memory)
-            else:
-                log_event(f"{tid}: External system returned no matching playbook; falling back to generic policy")
-                policy = {
-                    "scenario_id": "GENERIC_SLA_BREACH",
-                    "title": "Generic SLA breach escalation",
-                    "action": "ESCALATE",
-                    "vendor_queue": vendor,
-                    "steps": ["Attach basic diagnostics", "Escalate to vendor/ops queue"],
-                }
+                pid = learned["policy_id"]
+                log_event(f\"{tid}: Learned new scenario → {pid} ({learned['description']})\")
+                for step in learned.get(\"steps\", []):
+                    log_event(f\"{tid}: Learned step added → {step}\")
+                memory[pid] = learned
+                st.session_state[\"agent_memory\"] = memory
 
-        # Policy selected
-        action = str(policy.get("action", "ESCALATE")).upper()
-        log_event(f"{tid}: Policy selected → {policy.get('scenario_id','UNKNOWN')} | action={action}")
+                log_event(f\"{tid}: Re-running ticket evaluation using updated memory\")\n                matched_policy_id = pid\n            else:\n                log_event(f\"{tid}: External system returned no matching playbook; falling back to generic policy\")\n                matched_policy_id = \"GENERIC_SLA_BREACH\"\n\n        policy = memory.get(matched_policy_id, memory[\"GENERIC_SLA_BREACH\"])\n        action = str(policy.get(\"action\", \"ESCALATE\")).upper()\n\n        log_event(f\"{tid}: Policy selected → {matched_policy_id} | action={action}\")\n\n        # Execute policy\n        if action == \"ESCALATE\":\n            log_event(f\"{tid}: Preparing escalation to {vendor} with diagnostics attached\")\n            _attach_diagnostics(tid)\n            log_event(\n                f\"{tid}: Escalation message sent to {vendor}: \"\n                f\"Escalating {tid}: SLA breached ({breach_hours}). Diagnostics attached.\"\n            )\n            log_event(f\"{tid}: Escalated to vendor system / ops queue for further action\")\n\n            # If the learned policy includes vendor-response -> schedule it\n            if policy.get(\"vendor_response\") and policy.get(\"fix_action\"):\n                log_event(f\"{tid}: Awaiting NPDB vendor response (simulated wait)\")\n                _schedule_vendor_response(\n                    ticket_id=tid,\n                    vendor_response=str(policy[\"vendor_response\"]),\n                    fix_action=str(policy[\"fix_action\"]),\n                    delay_seconds=5,\n                )\n\n        elif action == \"AUTO_RETRY\":\n            log_event(f\"{tid}: Triggered auto-retry workflow\")\n            log_event(f\"{tid}: Auto-retry did not resolve within expected window; escalating to ops queue\")\n        else:\n            log_event(f\"{tid}: Monitoring — no immediate action required\")\n\n    st.session_state[\"agent_last_run\"] = _now()\n    st.session_state[\"agent_next_run\"] = _now() + timedelta(minutes=30)\n    log_event(\"Agent run completed: actions logged for breached tickets\")\n\n\n# ============================\n# Page\n# ============================\n\nst.set_page_config(page_title=\"Daily Ticket Dashboard\", layout=\"wide\")\n\n# Session defaults\nst.session_state.setdefault(\"event_logs\", [])\nst.session_state.setdefault(\"agent_progress\", [])\nst.session_state.setdefault(\"agent_last_run\", None)\nst.session_state.setdefault(\"agent_next_run\", None)\nst.session_state.setdefault(\"data_df\", None)\nst.session_state.setdefault(\"pending_vendor_responses\", [])\nst.session_state.setdefault(\"agent_memory\", _default_agent_memory())\nst.session_state.setdefault(\"last_upload_fingerprint\", None)\nst.session_state.setdefault(\"auto_refresh_enabled\", True)\nst.session_state.setdefault(\"auto_refresh_interval_ms\", 1000)\n\n# IMPORTANT: process pending vendor responses on every rerun\nprocess_pending_vendor_responses()\n\n# CSS\nst.markdown(\n    \"\"\"\n    <style>\n      .metric-wrap {white-space: normal !important;}\n      .ticket-types {white-space: normal; word-break: break-word; line-height: 1.4;}\n      .event-log {\n        background: #0b0f0d;\n        border-radius: 14px;\n        padding: 14px 14px;\n        border: 1px solid rgba(255,255,255,0.08);\n        max-height: 420px;\n        overflow-y: auto;\n        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;\n        font-size: 12.5px;\n        line-height: 1.45;\n        color: #a6ffb6;\n      }\n      .event-line {margin-bottom: 6px;}\n      .small-muted {color: rgba(0,0,0,0.55); font-size: 12px;}\n      .pill {\n        display: inline-block;\n        padding: 3px 9px;\n        border-radius: 999px;\n        font-size: 12px;\n        border: 1px solid rgba(0,0,0,0.12);\n        background: rgba(0,0,0,0.03);\n      }\n    </style>\n    \"\"\",\n    unsafe_allow_html=True,\n)\n\nleft, right = st.columns([2.6, 1.2], gap=\"large\")\n\nwith left:\n    st.title(\"Daily Ticket Dashboard\")\n\n    df = st.session_state.get(\"data_df\")\n    total = int(len(df)) if isinstance(df, pd.DataFrame) else 0\n    breached = int(df.apply(_is_breached, axis=1).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0\n    stuck = int(df.apply(_is_stuck, axis=1).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0\n\n    m1, m2, m3, m4 = st.columns(4)\n    m1.metric(\"Total Tickets\", total)\n    m2.metric(\"Breached Tickets\", breached)\n    m3.metric(\"Stuck Tickets\", stuck)\n    with m4:\n        st.markdown(\"**Ticket Types**\")\n        st.markdown(f\"<div class='ticket-types'>{_ticket_types_summary(df)}</div>\", unsafe_allow_html=True)\n\n    st.subheader(\"Ticket Queue\")\n\n    if not isinstance(df, pd.DataFrame) or df.empty:\n        st.info(\"Upload test data (CSV/JSON) on the right to populate the dashboard.\")\n    else:\n        df_view = df.copy()\n        df_view[\"is_breached\"] = df_view.apply(_is_breached, axis=1)\n        df_view[\"is_stuck\"] = df_view.apply(_is_stuck, axis=1)\n\n        # fixed tickets go last\n        df_view[\"is_fixed\"] = df_view[\"status\"].astype(str).str.upper().eq(\"FIXED\")\n\n        df_view = df_view.sort_values(\n            by=[\"is_fixed\", \"is_breached\", \"is_stuck\", \"breach_hours_num\"],\n            ascending=[True, False, False, False],\n        )\n\n        for _, row in df_view.iterrows():\n            tid = row.get(\"ticket_id\", \"UNKNOWN\")\n            ttype = row.get(\"type\", \"UNKNOWN\")\n            sla_status = row.get(\"sla_status\", \"-\")\n            breach_hours = row.get(\"breach_hours\") or (\n                f\"+{int(row['breach_hours_num'])}h\" if pd.notna(row.get(\"breach_hours_num\")) else \"\"\n            )\n            action = row.get(\"action\", \"MONITOR\")\n            status = row.get(\"status\", \"-\")\n\n            header_cols = st.columns([1.4, 1.0, 1.2, 1.0, 0.6])\n\n            with header_cols[1]:\n                st.markdown(f\"**{ttype}**\")\n\n            with header_cols[2]:\n                if str(status).upper() == \"FIXED\":\n                    st.markdown(f\"<span class='pill'>RESOLVED</span>\", unsafe_allow_html=True)\n                elif \"BREACH\" in str(sla_status).upper():\n                    st.markdown(f\"**:red[{sla_status}]**  \\n{breach_hours}\")\n                else:\n                    st.markdown(f\"**{sla_status}**  \\n{breach_hours}\")\n\n            with header_cols[3]:\n                act = str(action).upper()\n                if act == \"FIXED\":\n                    st.markdown(\"**:green[FIXED]**\")\n                elif act == \"ESCALATE\":\n                    st.markdown(f\"**:red[{act}]**\")\n                elif act == \"AUTO_RETRY\":\n                    st.markdown(f\"**:green[{act}]**\")\n                else:\n                    st.markdown(f\"**{act}**\")\n\n            with header_cols[4]:\n                st.write(\"\")\n\n            with st.expander(f\"{tid}\", expanded=False):\n                st.markdown(f\"**Status**  \\n{row.get('status','-')}\")\n                st.markdown(f\"**Context**  \\n{row.get('context','-')}\")\n                st.markdown(f\"**Root cause**  \\n{row.get('root_cause','-')}\")\n                st.markdown(f\"**Impact**  \\n{row.get('impact','-')}\")\n                st.markdown(f\"**Recommended next steps**  \\n{row.get('recommended_next_steps','-')}\")\n                vendor = row.get(\"vendor\") or \"-\"\n                st.markdown(f\"**Vendor / system**  \\n{vendor}\")\n\n            st.divider()\n\nwith right:\n    st.markdown(\"### AI Agent Progress\")\n    st.markdown(\"<div class='small-muted'>Uploads drive the run. No manual ticket processing.</div>\", unsafe_allow_html=True)\n\n    last_run = st.session_state.get(\"agent_last_run\")\n    next_run = st.session_state.get(\"agent_next_run\")\n    if last_run and next_run:\n        st.caption(f\"Last run: {last_run.strftime('%H:%M:%S')}  ·  Next run: {next_run.strftime('%H:%M:%S')}\")\n    else:\n        st.caption(\"Upload data to get started.\")\n\n    uploaded = st.file_uploader(\"Upload test data (CSV/JSON)\", type=[\"csv\", \"json\"])\n\n    # IMPORTANT: only load on new upload fingerprint\n    fp = _fingerprint_upload(uploaded)\n    if uploaded is not None and fp != st.session_state.get(\"last_upload_fingerprint\"):\n        raw_df = _safe_read_upload(uploaded)\n        df_loaded = _coerce_columns(raw_df) if raw_df is not None else None\n        if isinstance(df_loaded, pd.DataFrame) and not df_loaded.empty:\n            st.session_state[\"data_df\"] = df_loaded\n            st.session_state[\"last_upload_fingerprint\"] = fp\n            st.success(f\"Loaded {len(df_loaded)} tickets from {uploaded.name}\")\n\n    run_col, clear_col = st.columns([1.2, 0.8])\n\n    with run_col:\n        if st.button(\"Run agent on current data\", use_container_width=True):\n            df_run = st.session_state.get(\"data_df\")\n            simulate_agent(df_run)\n\n    with clear_col:\n        if st.button(\"Clear logs\", use_container_width=True):\n            reset_simulation(clear_data=False)\n            st.toast(\"Logs cleared\")\n\n    # Auto refresh controls\n    pending_sec = _pending_countdown_seconds()\n    pending_ct = len(st.session_state.get(\"pending_vendor_responses\", []))\n\n    st.session_state[\"auto_refresh_enabled\"] = st.toggle(\n        \"Auto-refresh while waiting for vendor response\",\n        value=st.session_state.get(\"auto_refresh_enabled\", True),\n    )\n\n    if pending_ct > 0:\n        st.info(\n            f\"Pending vendor responses: {pending_ct}\" + (f\" · next in ~{pending_sec}s\" if pending_sec is not None else \"\")\n        )\n\n    # If waiting on vendor response, auto-rerun the script so status changes appear\n    if pending_ct > 0 and st.session_state.get(\"auto_refresh_enabled\", True):\n        try:\n            st.autorefresh(interval=st.session_state.get(\"auto_refresh_interval_ms\", 1000), key=\"vendor_wait_refresh\")\n        except Exception:\n            # If autorefresh isn't available in the deployed Streamlit version,\n            # the UI will still update on any interaction.\n            pass\n\n    # Progress checklist\n    progress = st.session_state.get(\"agent_progress\", [])\n    if progress:\n        st.markdown(\"\".join([f\"- ✅ {p}\\n\" for p in progress]))\n\n    st.markdown(\"### Agent Event Logs\")\n    logs = st.session_state.get(\"event_logs\", [])\n\n    if not logs:\n        st.info(\"No events yet. Run the agent to generate logs.\")\n    else:\n        st.markdown(\n            \"<div class='event-log'>\"\n            + \"\".join(\n                [\n                    f\"<div class='event-line'>{html.escape(str(line)).replace(chr(10), '<br/>')}</div>\"\n                    for line in logs[-200:]\n                ]\n            )\n            + \"</div>\",\n            unsafe_allow_html=True,\n        )\n```
 
-        # Execute action
-        if action == "ESCALATE":
-            # Attach diagnostics + escalate
-            log_event(f"{tid}: Preparing escalation to {vendor} with diagnostics attached")
-            log_event(f"{tid}: Attaching traces/correlation IDs for {tid} and NPDB gateway errors")
-            log_event(f"{tid}: Escalation message sent to {vendor}: Escalating {tid}: SLA breached ({breach_hours}). Diagnostics attached.")
-            log_event(f"{tid}: Escalated to vendor system / ops queue for further action")
+---
 
-            # Update ticket's action immediately to ESCALATE (until fixed)
-            df = st.session_state.get("data_df")
-            df = update_ticket(df, tid, {"action": "ESCALATE"})
-            st.session_state["data_df"] = df
+## Do you need to click anything to refresh?
+**No (if auto-refresh is ON).**  
+When the agent is “Awaiting NPDB vendor response”, the app will auto-rerun every ~1s until the vendor response is processed, then **TCK-1001 flips to FIXED** in the ticket queue.
 
-            # If policy defines vendor response -> schedule an auto-fix
-            fix_after = policy.get("fix_after_seconds")
-            if isinstance(fix_after, (int, float)) and fix_after > 0:
-                log_event(f"{tid}: Awaiting NPDB vendor response (simulated wait)")
-                st.session_state.setdefault("pending_vendor_fixes", {})
-                st.session_state["pending_vendor_fixes"][tid] = {
-                    "execute_at": _now() + timedelta(seconds=float(fix_after)),
-                    "vendor": vendor,
-                    "response_text": policy.get("vendor_response_text", "Vendor responded with fix"),
-                }
+If your Streamlit deployment doesn’t support `st.autorefresh`, then you’ll need *some* UI interaction to trigger a rerun (e.g., clicking anywhere). But in most recent Streamlit versions, it works without clicks.
 
-        elif action == "AUTO_RETRY":
-            log_event(f"{tid}: Triggered auto-retry workflow")
-            log_event(f"{tid}: Auto-retry did not resolve within expected window; escalating to ops queue")
-            df = st.session_state.get("data_df")
-            df = update_ticket(df, tid, {"action": "AUTO_RETRY"})
-            st.session_state["data_df"] = df
-        else:
-            log_event(f"{tid}: Monitoring — no immediate action required")
-            df = st.session_state.get("data_df")
-            df = update_ticket(df, tid, {"action": "MONITOR"})
-            st.session_state["data_df"] = df
-
-    st.session_state["agent_last_run"] = _now()
-    st.session_state["agent_next_run"] = _now() + timedelta(minutes=30)
-    log_event("Agent run completed: actions logged for breached tickets")
-    st.session_state["agent_running"] = False
-
-
-def process_pending_vendor_fixes() -> None:
-    """
-    Runs on every rerun. If a pending vendor fix's execute_at has passed:
-      - log vendor response
-      - apply fix
-      - update ticket status + action to FIXED
-    """
-    pending = st.session_state.get("pending_vendor_fixes", {}) or {}
-    if not pending:
-        return
-
-    now = _now()
-    to_remove = []
-
-    for tid, job in pending.items():
-        execute_at = job.get("execute_at")
-        if execute_at and now >= execute_at:
-            log_event(f"{tid}: Received response from NPDB vendor: {job.get('response_text','Vendor responded with fix')}")
-            log_event(f"{tid}: Applying vendor-provided fix for {tid} (e.g., gateway retry/backoff config)")
-
-            df = st.session_state.get("data_df")
-            df = update_ticket(df, tid, {
-                "status": "FIXED",
-                "sla_status": "RESOLVED",
-                "action": "FIXED",
-            })
-            st.session_state["data_df"] = df
-
-            log_event(f"{tid}: Ticket updated to FIXED in system (status changed, monitoring resumed)")
-            to_remove.append(tid)
-
-    for tid in to_remove:
-        pending.pop(tid, None)
-
-    st.session_state["pending_vendor_fixes"] = pending
-
-
-# ----------------------------
-# Page config + state defaults
-# ----------------------------
-st.set_page_config(page_title="Daily Ticket Dashboard", layout="wide")
-
-st.session_state.setdefault("event_logs", [])
-st.session_state.setdefault("agent_progress", [])
-st.session_state.setdefault("agent_last_run", None)
-st.session_state.setdefault("agent_next_run", None)
-st.session_state.setdefault("data_df", None)
-
-# Prevent uploaded data from overwriting in-memory updates on reruns
-st.session_state.setdefault("data_fingerprint", None)
-st.session_state.setdefault("data_source_name", None)
-
-# Self-learning memory store
-st.session_state.setdefault("agent_memory", {})
-
-# Pending vendor responses / fixes
-st.session_state.setdefault("pending_vendor_fixes", {})
-
-# Agent run flag
-st.session_state.setdefault("agent_running", False)
-
-# CSS
-st.markdown(
-    """
-    <style>
-      .ticket-types {white-space: normal; word-break: break-word; line-height: 1.4;}
-      .event-log {
-        background: #0b0f0d;
-        border-radius: 14px;
-        padding: 14px 14px;
-        border: 1px solid rgba(255,255,255,0.08);
-        max-height: 420px;
-        overflow-y: auto;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 12.5px;
-        line-height: 1.45;
-        color: #a6ffb6;
-      }
-      .event-line {margin-bottom: 6px;}
-      .small-muted {color: rgba(0,0,0,0.55); font-size: 12px;}
-      .pill-fixed {display:inline-block; padding:2px 8px; border-radius:999px; background:#e7f7ee; color:#157347; font-weight:600;}
-      .pill-esc {display:inline-block; padding:2px 8px; border-radius:999px; background:#ffe9e9; color:#b02a37; font-weight:600;}
-      .pill-mon {display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; font-weight:600;}
-      .pill-retry {display:inline-block; padding:2px 8px; border-radius:999px; background:#e8f5ff; color:#0b5ed7; font-weight:600;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# IMPORTANT: process pending fixes before rendering UI so the queue reflects FIXED immediately
-process_pending_vendor_fixes()
-
-# Auto-refresh while pending vendor fixes exist (so FIXED happens without clicks)
-if st.session_state.get("pending_vendor_fixes"):
-    st.autorefresh(interval=1000, key="agent_autorefresh")
-
-
-# ----------------------------
-# Layout
-# ----------------------------
-left, right = st.columns([2.6, 1.2], gap="large")
-
-with left:
-    st.title("Daily Ticket Dashboard")
-
-    df = st.session_state.get("data_df")
-    total = int(len(df)) if isinstance(df, pd.DataFrame) else 0
-    breached = int(df.apply(_is_breached, axis=1).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0
-    stuck = int(df.apply(_is_stuck, axis=1).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Tickets", total)
-    m2.metric("Breached Tickets", breached)
-    m3.metric("Stuck Tickets", stuck)
-
-    with m4:
-        st.markdown("**Ticket Types**")
-        st.markdown(f"<div class='ticket-types'>{_ticket_types_summary(df)}</div>", unsafe_allow_html=True)
-
-    st.subheader("Ticket Queue")
-
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        st.info("Upload test data (CSV/JSON) on the right to populate the dashboard.")
-    else:
-        df_view = df.copy()
-        df_view["is_breached"] = df_view.apply(_is_breached, axis=1)
-        df_view["is_stuck"] = df_view.apply(_is_stuck, axis=1)
-
-        # Sort: breached first, then stuck, then higher breach first
-        df_view = df_view.sort_values(
-            by=["is_breached", "is_stuck", "breach_hours_num"],
-            ascending=[False, False, False],
-        )
-
-        for _, row in df_view.iterrows():
-            tid = row.get("ticket_id", "UNKNOWN")
-            ttype = row.get("type", "UNKNOWN")
-            sla_status = row.get("sla_status", "-")
-            breach_hours = row.get("breach_hours") or (
-                f"+{int(row['breach_hours_num'])}h" if pd.notna(row.get("breach_hours_num")) else ""
-            )
-
-            status_val = str(row.get("status", "")).strip().upper()
-            action_raw = str(row.get("action", "MONITOR")).strip().upper()
-            action_val = "FIXED" if status_val == "FIXED" else action_raw
-
-            header_cols = st.columns([1.4, 1.0, 1.2, 1.0, 0.6])
-
-            with header_cols[0]:
-                pass
-
-            with header_cols[1]:
-                st.markdown(f"**{ttype}**")
-
-            with header_cols[2]:
-                if "BREACH" in str(sla_status).upper():
-                    st.markdown(f"**:red[{sla_status}]**  \n{breach_hours}")
-                else:
-                    st.markdown(f"**{sla_status}**  \n{breach_hours}")
-
-            with header_cols[3]:
-                if action_val == "FIXED":
-                    st.markdown("<span class='pill-fixed'>FIXED</span>", unsafe_allow_html=True)
-                elif action_val == "ESCALATE":
-                    st.markdown("<span class='pill-esc'>ESCALATE</span>", unsafe_allow_html=True)
-                elif action_val == "AUTO_RETRY":
-                    st.markdown("<span class='pill-retry'>AUTO_RETRY</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<span class='pill-mon'>MONITOR</span>", unsafe_allow_html=True)
-
-            with header_cols[4]:
-                st.write("")
-
-            with st.expander(f"{tid}", expanded=False):
-                st.markdown(f"**Status**  \n{row.get('status','-')}")
-                st.markdown(f"**Context**  \n{row.get('context','-')}")
-                st.markdown(f"**Root cause**  \n{row.get('root_cause','-')}")
-                st.markdown(f"**Impact**  \n{row.get('impact','-')}")
-                st.markdown(f"**Recommended next steps**  \n{row.get('recommended_next_steps','-')}")
-                vendor = row.get("vendor") or "-"
-                st.markdown(f"**Vendor / system**  \n{vendor}")
-
-            st.divider()
-
-with right:
-    st.markdown("### AI Agent Progress")
-    st.markdown("<div class='small-muted'>Uploads drive the run. No manual ticket processing.</div>", unsafe_allow_html=True)
-
-    last_run = st.session_state.get("agent_last_run")
-    next_run = st.session_state.get("agent_next_run")
-    if last_run and next_run:
-        st.caption(f"Last run: {last_run.strftime('%H:%M:%S')}  ·  Next run: {next_run.strftime('%H:%M:%S')}")
-    else:
-        st.caption("Upload data to get started.")
-
-    uploaded = st.file_uploader("Upload test data (CSV/JSON)", type=["csv", "json"])
-
-    # Upload fingerprinting:
-    # - If file content changed -> load it
-    # - If rerun with same file -> do NOT reload (preserves FIXED updates)
-    if uploaded is not None:
-        raw_bytes = uploaded.getvalue()
-        fp = _fingerprint_bytes(raw_bytes)
-        if st.session_state.get("data_fingerprint") != fp:
-            # Fresh load only when file changes
-            # Rebuild file-like object: use bytes and pandas/json loaders
-            name = uploaded.name.lower()
-            try:
-                if name.endswith(".csv"):
-                    raw_df = pd.read_csv(pd.io.common.BytesIO(raw_bytes))
-                else:
-                    payload = json.loads(raw_bytes.decode("utf-8"))
-                    if isinstance(payload, dict) and "tickets" in payload:
-                        payload = payload["tickets"]
-                    raw_df = pd.DataFrame(payload)
-
-                df_loaded = _coerce_columns(raw_df)
-                if isinstance(df_loaded, pd.DataFrame) and not df_loaded.empty:
-                    st.session_state["data_df"] = df_loaded
-                    st.session_state["data_fingerprint"] = fp
-                    st.session_state["data_source_name"] = uploaded.name
-                    st.success(f"Loaded {len(df_loaded)} tickets from {uploaded.name}")
-            except Exception as e:
-                st.error(f"Could not read file: {e}")
-        else:
-            st.caption(f"Using current loaded data from {st.session_state.get('data_source_name', uploaded.name)}")
-
-    run_col, clear_col = st.columns([1.2, 0.8])
-
-    with run_col:
-        if st.button("Run agent on current data", use_container_width=True):
-            df_run = st.session_state.get("data_df")
-            simulate_agent(df_run)
-
-    with clear_col:
-        if st.button("Clear logs", use_container_width=True):
-            # Clear logs + pending fixes; keep data so you can rerun quickly
-            st.session_state["event_logs"] = []
-            st.session_state["agent_progress"] = []
-            st.session_state["agent_last_run"] = None
-            st.session_state["agent_next_run"] = None
-            st.session_state["pending_vendor_fixes"] = {}
-            st.toast("Logs cleared")
-
-    progress = st.session_state.get("agent_progress", [])
-    if progress:
-        st.markdown("".join([f"- ✅ {p}\n" for p in progress]))
-
-    # Optional: Show learned scenarios (small, for demo)
-    mem = st.session_state.get("agent_memory", {})
-    if mem:
-        st.markdown("**Learned scenarios in memory**")
-        for sid, pol in mem.items():
-            st.caption(f"• {sid}: {pol.get('title','')}")
-
-    st.markdown("### Agent Event Logs")
-    logs = st.session_state.get("event_logs", [])
-    if not logs:
-        st.info("No events yet. Run the agent to generate logs.")
-    else:
-        st.markdown(
-            "<div class='event-log'>"
-            + "".join(
-                [
-                    f"<div class='event-line'>{html.escape(str(line)).replace(chr(10), '<br/>')}</div>"
-                    for line in logs[-250:]
-                ]
-            )
-            + "</div>",
-            unsafe_allow_html=True,
-        )
+If you want, paste your deployed Streamlit version (`st.__version__`) and I’ll tell you whether `st.autorefresh` is supported in your runtime.
+::contentReference[oaicite:0]{index=0}
