@@ -1,5 +1,6 @@
 import json
 import html
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -23,19 +24,16 @@ def log_event(message: str) -> None:
     st.session_state.setdefault("event_logs", [])
     st.session_state["event_logs"].append(f"{_now_str()} — {message}")
 
+
 def _default_agent_memory() -> Dict[str, Dict[str, Any]]:
     return {
         "GENERIC_SLA_BREACH": {
-            "match_keywords": [],  # ❗ IMPORTANT: empty list
+            "match_keywords": [],  # fallback only
             "description": "Generic SLA breach escalation (fallback only)",
             "action": "ESCALATE",
-            "steps": [
-                "Attach basic diagnostics",
-                "Escalate to vendor/ops queue",
-            ],
+            "steps": ["Attach basic diagnostics", "Escalate to vendor/ops queue"],
         }
     }
-
 
 
 def reset_simulation(clear_data: bool = False) -> None:
@@ -201,7 +199,7 @@ def _memory_match_policy(memory: Dict[str, Dict[str, Any]], row: pd.Series) -> O
 
     for pid, pol in memory.items():
         if pid == "GENERIC_SLA_BREACH":
-            continue  # ❗ fallback only
+            continue  # fallback only
 
         kws = [k.lower() for k in pol.get("match_keywords", []) if k]
         if not kws:
@@ -211,8 +209,6 @@ def _memory_match_policy(memory: Dict[str, Dict[str, Any]], row: pd.Series) -> O
             return pid
 
     return None
-
-
 
 
 def _attach_diagnostics(tid: str) -> None:
@@ -236,6 +232,7 @@ def _mark_ticket_fixed(ticket_id: str) -> None:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return
 
+    df = df.copy()
     mask = df["ticket_id"].astype(str) == str(ticket_id)
     if not mask.any():
         return
@@ -246,6 +243,7 @@ def _mark_ticket_fixed(ticket_id: str) -> None:
     df.loc[mask, "breach_hours"] = "0h"
     df.loc[mask, "breach_hours_num"] = 0.0
 
+    df = _coerce_columns(df)  # ensure action inference stays consistent
     st.session_state["data_df"] = df
 
 
@@ -402,6 +400,8 @@ st.session_state.setdefault("pending_vendor_responses", [])
 st.session_state.setdefault("agent_memory", _default_agent_memory())
 st.session_state.setdefault("last_upload_fingerprint", None)
 st.session_state.setdefault("auto_refresh_enabled", True)
+st.session_state.setdefault("refresh_interval_sec", 1)
+st.session_state.setdefault("last_auto_rerun_ts", 0.0)
 
 # process pending vendor responses on every rerun
 process_pending_vendor_responses()
@@ -546,11 +546,13 @@ with right:
         if st.button("Run agent on current data", use_container_width=True):
             df_run = st.session_state.get("data_df")
             simulate_agent(df_run)
+            st.rerun()  # ensure UI updates immediately after run
 
     with clear_col:
         if st.button("Clear logs", use_container_width=True):
             reset_simulation(clear_data=False)
             st.toast("Logs cleared")
+            st.rerun()
 
     pending_ct = len(st.session_state.get("pending_vendor_responses", []))
     pending_sec = _pending_countdown_seconds()
@@ -561,14 +563,10 @@ with right:
     )
 
     if pending_ct > 0:
-        st.info(f"Pending vendor responses: {pending_ct}" + (f" · next in ~{pending_sec}s" if pending_sec is not None else ""))
-
-    # Auto rerun while waiting, so FIXED status appears without user clicking.
-    if pending_ct > 0 and st.session_state.get("auto_refresh_enabled", True):
-        try:
-            st.autorefresh(interval=1000, key="vendor_wait_refresh")
-        except Exception:
-            pass
+        st.info(
+            f"Pending vendor responses: {pending_ct}"
+            + (f" · next in ~{pending_sec}s" if pending_sec is not None else "")
+        )
 
     progress = st.session_state.get("agent_progress", [])
     if progress:
@@ -588,3 +586,16 @@ with right:
             + "</div>",
             unsafe_allow_html=True,
         )
+
+    # ✅ Reliable auto-refresh without external packages
+    # Streamlit doesn't run in the background — so we do a controlled rerun loop
+    if pending_ct > 0 and st.session_state.get("auto_refresh_enabled", True):
+        interval = int(st.session_state.get("refresh_interval_sec", 1))
+        last_ts = float(st.session_state.get("last_auto_rerun_ts", 0.0))
+        now_ts = time.time()
+
+        # throttle reruns
+        if now_ts - last_ts >= max(0.8, float(interval)):
+            st.session_state["last_auto_rerun_ts"] = now_ts
+            time.sleep(interval)
+            st.rerun()
