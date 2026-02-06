@@ -438,19 +438,34 @@ def simulate_agent(df: pd.DataFrame) -> None:
                 apply_msg = f"Applying vendor-provided fix for {tid} (e.g., gateway retry/backoff config)"
                 log_event(f"{tid}: {apply_msg}")
                 # Update ticket in the main dataframe stored in session state
+              
                 if "data_df" in st.session_state and isinstance(st.session_state["data_df"], pd.DataFrame):
                     df_main = st.session_state["data_df"]
-                    idx = df_main.index[df_main["ticket_id"] == tid].tolist()
+                
+                    # Ensure string compare is consistent
+                    df_main["ticket_id"] = df_main["ticket_id"].astype(str)
+                
+                    idx = df_main.index[df_main["ticket_id"] == str(tid)].tolist()
                     if idx:
-                        df_main.at[idx[0], "status"] = "FIXED"
-                        df_main.at[idx[0], "sla_status"] = "RESOLVED"
-                        df_main.at[idx[0], "action"] = "MONITOR"
-                        st.session_state["data_df"] = df_main  # reassign to ensure session_state notices change
-                        log_event(f"{tid}: Ticket updated to FIXED in system (status changed, monitoring resumed)")
+                        i = idx[0]
+                
+                        df_main.at[i, "status"] = "FIXED"
+                        df_main.at[i, "sla_status"] = "RESOLVED"
+                
+                        # IMPORTANT: reflect on the queue "action" column too
+                        df_main.at[i, "action"] = "FIXED"
+                
+                        # Optional: clean up next steps once fixed
+                        if "recommended_next_steps" in df_main.columns:
+                            df_main.at[i, "recommended_next_steps"] = "Monitoring (post-fix)"
+                
+                        st.session_state["data_df"] = df_main
+                        log_event(f"{tid}: Ticket updated to FIXED in system (status/action changed, monitoring resumed)")
                     else:
                         log_event(f"{tid}: Could not find ticket in session data to update status")
                 else:
                     log_event(f"{tid}: No session dataframe available to update ticket status")
+
 
         elif action == "AUTO_RETRY":
             log_event(f"{tid}: Triggered auto-retry workflow")
@@ -556,7 +571,19 @@ with left:
             breach_hours = row.get("breach_hours") or (
                 f"+{int(row['breach_hours_num'])}h" if pd.notna(row.get("breach_hours_num")) else ""
             )
+          status_val = str(row.get("status", "")).upper().strip()
             action = row.get("action", "MONITOR")
+            
+            # Display override: if ticket is fixed, always show FIXED in the action slot
+                 if display_action == "ESCALATE":
+            st.markdown(f"**:red[{display_action}]**")
+                elif display_action == "AUTO_RETRY":
+            st.markdown(f"**:green[{display_action}]**")
+                elif display_action == "FIXED":
+            st.markdown(f"**:blue[{display_action}]**")
+                else:
+            st.markdown(f"**{display_action}**")
+
 
             header_cols = st.columns([1.6, 1.0, 1.2, 1.0, 0.4])
             with header_cols[0]:
