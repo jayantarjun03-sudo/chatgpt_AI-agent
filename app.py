@@ -1,4 +1,5 @@
 import json
+import html
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
