@@ -23,12 +23,11 @@ def log_event(message: str) -> None:
     st.session_state.setdefault("event_logs", [])
     st.session_state["event_logs"].append(f"{_now_str()} — {message}")
 
-
 def _default_agent_memory() -> Dict[str, Dict[str, Any]]:
     return {
         "GENERIC_SLA_BREACH": {
-            "match_keywords": ["breach", "sla"],
-            "description": "Generic SLA breach escalation",
+            "match_keywords": [],  # ❗ IMPORTANT: empty list
+            "description": "Generic SLA breach escalation (fallback only)",
             "action": "ESCALATE",
             "steps": [
                 "Attach basic diagnostics",
@@ -36,6 +35,7 @@ def _default_agent_memory() -> Dict[str, Dict[str, Any]]:
             ],
         }
     }
+
 
 
 def reset_simulation(clear_data: bool = False) -> None:
@@ -193,12 +193,26 @@ def _external_system_lookup(row: pd.Series) -> Optional[Dict[str, Any]]:
 
 
 def _memory_match_policy(memory: Dict[str, Dict[str, Any]], row: pd.Series) -> Optional[str]:
-    haystack = (str(row.get("context", "")) + " " + str(row.get("root_cause", "")) + " " + str(row.get("sla_status", ""))).lower()
+    haystack = (
+        str(row.get("context", "")) + " " +
+        str(row.get("root_cause", "")) + " " +
+        str(row.get("sla_status", ""))
+    ).lower()
+
     for pid, pol in memory.items():
-        kws = [k.lower() for k in pol.get("match_keywords", [])]
+        if pid == "GENERIC_SLA_BREACH":
+            continue  # ❗ fallback only
+
+        kws = [k.lower() for k in pol.get("match_keywords", []) if k]
+        if not kws:
+            continue
+
         if any(k in haystack for k in kws):
             return pid
+
     return None
+
+
 
 
 def _attach_diagnostics(tid: str) -> None:
