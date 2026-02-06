@@ -1,5 +1,6 @@
 import json
 import html
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -207,11 +208,12 @@ def _default_external_kb() -> Dict[str, Dict[str, Any]]:
             "action": "ESCALATE",
             "priority": 100,
             "source": "external_kb",
-            # Optional extra log hints (what agent 'learned' to do)
+            # Extra log hints (what agent 'learned' to do)
             "learned_steps": [
                 "Pull NPDB gateway error metrics for last 60 minutes",
                 "Attach timeout traces and correlation IDs",
                 "Escalate to NPDB vendor queue with diagnostics",
+                "Await vendor response and apply provided fix if available",
             ],
         },
         # Another example (optional)
@@ -331,13 +333,12 @@ def simulate_agent(df: pd.DataFrame) -> None:
           1) unknown scenario detected → log
           2) query external KB → add learned policy into memory → log
           3) rerun evaluation for the ticket → apply fix / escalate → log
-      - ensure escalation logs include "message sent" and "escalated"
+      - For NPDB escalation, simulate vendor response after 5s and apply fix updating the ticket status to FIXED.
     """
     if df is None or df.empty:
         st.warning("No data loaded.")
         return
 
-    memory = st.session_state.get("agent_memory", [])
     breached_df = df[df.apply(_is_breached, axis=1)].copy()
 
     st.session_state["agent_progress"] = []
@@ -362,6 +363,7 @@ def simulate_agent(df: pd.DataFrame) -> None:
         log_event("Agent run completed")
         return
 
+    # For each breached ticket, process and possibly learn
     for _, row in breached_df.iterrows():
         tid = row.get("ticket_id", "UNKNOWN")
         ttype = row.get("type", "UNKNOWN")
@@ -391,9 +393,7 @@ def simulate_agent(df: pd.DataFrame) -> None:
             if learned:
                 # Store learned policy in agent memory
                 st.session_state["agent_memory"].append(learned)
-                log_event(
-                    f"{tid}: Learned new scenario → {learned['id']} ({learned.get('desc','')})"
-                )
+                log_event(f"{tid}: Learned new scenario → {learned['id']} ({learned.get('desc','')})")
                 if learned.get("learned_steps"):
                     for step in learned["learned_steps"]:
                         log_event(f"{tid}: Learned step added → {step}")
@@ -415,12 +415,43 @@ def simulate_agent(df: pd.DataFrame) -> None:
             action = "ESCALATE"
             log_event(f"{tid}: No policy matched; defaulting to ESCALATE")
 
-        # Execute
+        # Execute action
         if action == "ESCALATE":
-            # Required: show message sent and escalated
-            msg = f"Escalating {tid}: SLA breached (+{breach_hours}). Please review and prioritize resolution."
+            # If the learned scenario is the NPDB one, include diagnostic steps + await vendor response
+            log_event(f"{tid}: Preparing escalation to {vendor} with diagnostics attached")
+            diag_msg = f"Attaching traces/correlation IDs for {tid} and NPDB gateway errors"
+            log_event(f"{tid}: {diag_msg}")
+            msg = f"Escalating {tid}: SLA breached ({breach_hours}). Diagnostics attached."
             log_event(f"{tid}: Escalation message sent to {vendor}: {msg}")
             log_event(f"{tid}: Escalated to vendor system / ops queue for further action")
+
+            # If policy indicates NPDB gateway scenario, simulate vendor response after short wait and apply fix
+            if matched and matched.get("id") == "PORTING_NPDB_GATEWAY_TIMEOUT":
+                log_event(f"{tid}: Awaiting NPDB vendor response (simulated wait)")
+                # Simulate vendor response latency (non-background synchronous sleep)
+                time.sleep(3)  # simulated 3 seconds wait
+                # Simulate vendor response received
+                vendor_response = "NPDB vendor responded with gateway configuration fix applied"
+                log_event(f"{tid}: Received response from NPDB vendor: {vendor_response}")
+
+                # Agent applies fix based on vendor response
+                apply_msg = f"Applying vendor-provided fix for {tid} (e.g., gateway retry/backoff config)"
+                log_event(f"{tid}: {apply_msg}")
+                # Update ticket in the main dataframe stored in session state
+                if "data_df" in st.session_state and isinstance(st.session_state["data_df"], pd.DataFrame):
+                    df_main = st.session_state["data_df"]
+                    idx = df_main.index[df_main["ticket_id"] == tid].tolist()
+                    if idx:
+                        df_main.at[idx[0], "status"] = "FIXED"
+                        df_main.at[idx[0], "sla_status"] = "RESOLVED"
+                        df_main.at[idx[0], "action"] = "MONITOR"
+                        st.session_state["data_df"] = df_main  # reassign to ensure session_state notices change
+                        log_event(f"{tid}: Ticket updated to FIXED in system (status changed, monitoring resumed)")
+                    else:
+                        log_event(f"{tid}: Could not find ticket in session data to update status")
+                else:
+                    log_event(f"{tid}: No session dataframe available to update ticket status")
+
         elif action == "AUTO_RETRY":
             log_event(f"{tid}: Triggered auto-retry workflow")
             log_event(f"{tid}: Auto-retry did not resolve within expected window; escalating to ops queue")
